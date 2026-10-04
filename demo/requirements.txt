@@ -1,0 +1,11 @@
+# Demo requirements for the offline dependency-diff explainer.
+# Each line is a PEP 508 requirement.
+foo; python_version < "3.11"
+bar; extra == "fast"
+baz>=1.0
+qux; os_name == "plan9"
+quux; platform_release > "5.0"
+andex; os_name == "posix" and python_version < "3.11"
+orex; os_name == "plan9" or python_version < "3.11"
+dup>=2.0
+dup<1.0
