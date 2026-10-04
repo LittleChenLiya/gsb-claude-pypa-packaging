@@ -1,0 +1,7 @@
+# demo requirements for the offline marker diff explainer
+foo; python_version < "3.11"
+bar; extra == "fast" and python_version >= "3.10"
+baz>=2; python_version < "3.11" or extra == "fast"
+legacy-tool; python_version < "3.11" and os_name == "posix"
+qux==1.4
+qux>=2.0  # conflicting re-declaration of qux
