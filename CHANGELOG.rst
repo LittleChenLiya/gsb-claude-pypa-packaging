@@ -4,6 +4,14 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :mod:`packaging.wheel_url`, an offline verifier that correlates a
+  direct-URL requirement's name with the identity parsed from its wheel file
+  name and checks the wheel's tags against a target tag set, reporting
+  ``valid``, ``name-conflict``, ``incompatible``, ``unknown`` (never
+  downloaded to guess), or ``skipped-marker`` separately.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)
