@@ -9,7 +9,12 @@ import pickle
 import pytest
 
 from packaging.markers import Marker
-from packaging.requirements import InvalidRequirement, Requirement
+from packaging.requirements import (
+    ExtrasEditPlan,
+    InvalidRequirement,
+    Requirement,
+    StaleExtrasEditPlanError,
+)
 from packaging.specifiers import SpecifierSet
 
 EQUAL_DEPENDENCIES = [
@@ -1060,3 +1065,117 @@ def test_pickle_requirement_25_0_format_loads() -> None:
     assert str(r.specifier) == ">=2.0"
     assert r.marker is None
     assert r == Requirement("requests>=2.0")
+
+
+class TestExtrasEditPlan:
+    """Tests for the explicit extras edit plan API.
+
+    Run just these with:
+
+        python -m pytest tests/test_requirements.py -k ExtrasEditPlan
+    """
+
+    def test_add_extra_preserves_marker_bytes(self) -> None:
+        source = 'foo[a]; python_version < "3.12"'
+        new = ExtrasEditPlan(source).add("b").apply()
+        assert new == 'foo[a,b]; python_version < "3.12"'
+        # The marker (and everything after the extras section) is byte-identical.
+        assert new[new.index(";") :] == source[source.index(";") :]
+        # The edited string re-parses into an equivalent requirement.
+        req = Requirement(new)
+        assert req.extras == {"a", "b"}
+        assert str(req.marker) == 'python_version < "3.12"'
+
+    def test_add_extra_to_ipv6_url_requirement(self) -> None:
+        source = "foo @ http://[::1]:8080/pkg ; python_version < '3.12'"
+        new = ExtrasEditPlan(source).add("x").apply()
+        assert new == "foo[x] @ http://[::1]:8080/pkg ; python_version < '3.12'"
+        assert Requirement(new).url == "http://[::1]:8080/pkg"
+
+    def test_url_brackets_not_mistaken_for_extras(self) -> None:
+        # The brackets in an IPv6 URL are not an extras section: the plan
+        # sees no extras and inserts new ones right after the name.
+        plan = ExtrasEditPlan("foo @ http://[::1]/")
+        assert plan.extras == frozenset()
+        assert plan.add("extra").apply() == "foo[extra] @ http://[::1]/"
+
+    def test_duplicate_extras_merged_per_spec(self) -> None:
+        # Case- and separator-equivalent duplicates collapse to the first
+        # spelling seen (PEP 685 canonicalization).
+        assert ExtrasEditPlan("foo[SECURE,secure,Secure]").apply() == "foo[SECURE]"
+        assert ExtrasEditPlan("foo[sec_ure,sec-ure,sec.ure]").apply() == "foo[sec_ure]"
+
+    def test_add_canonical_duplicate_is_noop(self) -> None:
+        assert ExtrasEditPlan("foo[a]").add("A").apply() == "foo[a]"
+        plan = ExtrasEditPlan("foo[all-blue]").add("all_blue")
+        assert plan.apply() == "foo[all-blue]"
+
+    def test_remove_extra_case_and_separator_insensitive(self) -> None:
+        assert ExtrasEditPlan("foo[a,b]").remove("A").apply() == "foo[b]"
+        assert ExtrasEditPlan("foo[all-blue,x]").remove("all_blue").apply() == "foo[x]"
+
+    def test_remove_all_extras_drops_brackets(self) -> None:
+        source = 'foo[a]; python_version < "3.12"'
+        new = ExtrasEditPlan(source).remove("a").apply()
+        assert new == 'foo; python_version < "3.12"'
+
+    def test_add_to_requirement_without_extras(self) -> None:
+        assert ExtrasEditPlan("foo>=1").add("x").apply() == "foo[x]>=1"
+        assert ExtrasEditPlan("foo").add("x").apply() == "foo[x]"
+
+    def test_name_specifier_and_marker_bytes_preserved(self) -> None:
+        source = "Foo [ a ] >= 1.0 , < 2 ; os_name=='posix'"
+        new = ExtrasEditPlan(source).add("b").apply()
+        assert new == "Foo [a,b] >= 1.0 , < 2 ; os_name=='posix'"
+
+    def test_apply_without_edits_returns_baseline(self) -> None:
+        assert ExtrasEditPlan("foo[a]").apply() == "foo[a]"
+        assert ExtrasEditPlan("foo").apply() == "foo"
+
+    def test_apply_accepts_identical_baseline(self) -> None:
+        source = "foo[a]"
+        assert ExtrasEditPlan(source).add("b").apply(source) == "foo[a,b]"
+
+    def test_stale_plan_rejected_on_baseline_change(self) -> None:
+        plan = ExtrasEditPlan("foo[a]")
+        plan.add("b")
+        with pytest.raises(StaleExtrasEditPlanError):
+            plan.apply("foo[c]")
+
+    def test_extras_property_reflects_planned_edits(self) -> None:
+        plan = ExtrasEditPlan("foo[A,b]")
+        assert plan.extras == frozenset({"a", "b"})
+        plan.add("c").remove("B")
+        assert plan.extras == frozenset({"a", "c"})
+
+    def test_baseline_property(self) -> None:
+        assert ExtrasEditPlan("foo[a]").baseline == "foo[a]"
+
+    def test_chaining_returns_self(self) -> None:
+        plan = ExtrasEditPlan("foo")
+        assert plan.add("a") is plan
+        assert plan.remove("a") is plan
+
+    def test_invalid_extra_name_rejected(self) -> None:
+        plan = ExtrasEditPlan("foo")
+        for bad in ("", "not an extra", "a,b", "[x]", "a;b"):
+            with pytest.raises(InvalidRequirement):
+                plan.add(bad)
+            with pytest.raises(InvalidRequirement):
+                plan.remove(bad)
+
+    def test_invalid_requirement_string_rejected(self) -> None:
+        with pytest.raises(InvalidRequirement):
+            ExtrasEditPlan("foo[")
+
+    def test_edited_result_reparses_with_expected_extras(self) -> None:
+        new = ExtrasEditPlan("foo[a]>=1").add("b", "c").remove("a").apply()
+        assert new == "foo[b,c]>=1"
+        assert Requirement(new).extras == {"b", "c"}
+
+    def test_requirement_str_unchanged_by_plan_api(self) -> None:
+        # The plain Requirement string representation is unaffected.
+        assert (
+            str(Requirement('foo[ b ,a ]>=1 ; python_version<"3.12"'))
+            == 'foo[a,b]>=1; python_version < "3.12"'
+        )

@@ -5,8 +5,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from ._parser import MarkerList
 from ._parser import parse_requirement as _parse_requirement
+from ._tokenizer import DEFAULT_RULES as _DEFAULT_RULES
 from ._tokenizer import ParserSyntaxError
+from ._tokenizer import Tokenizer as _Tokenizer
 from .markers import Marker, _normalize_extra_values
 from .specifiers import InvalidSpecifier, SpecifierSet
 from .utils import canonicalize_name
@@ -15,8 +18,10 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 __all__ = [
+    "ExtrasEditPlan",
     "InvalidRequirement",
     "Requirement",
+    "StaleExtrasEditPlanError",
 ]
 
 
@@ -190,3 +195,200 @@ class Requirement:
             and self.url == other.url
             and self.marker == other.marker
         )
+
+
+class StaleExtrasEditPlanError(ValueError):
+    """
+    An extras edit plan was applied to a requirement string that differs
+    from the baseline the plan was created from.
+
+    .. versionadded:: 26.4
+    """
+
+
+def _check_extra_name(extra: str) -> None:
+    """Validate that ``extra`` is a single, well-formed extra name."""
+    if not isinstance(extra, str):
+        raise TypeError(f"extra name must be a string, got {type(extra).__name__}")
+    tokenizer = _Tokenizer(extra, rules=_DEFAULT_RULES)
+    try:
+        tokenizer.expect("IDENTIFIER", expected="extra name")
+        tokenizer.expect("END", expected="end of extra name")
+    except ParserSyntaxError as e:
+        raise InvalidRequirement(f"Invalid extra name: {extra!r}") from e
+
+
+def _marker_text(marker: MarkerList | None) -> str | None:
+    """Serialize a parsed marker the same way :class:`Requirement` does."""
+    if marker is None:
+        return None
+    normalized = Marker.__new__(Marker)
+    normalized._markers = _normalize_extra_values(marker)
+    return str(normalized)
+
+
+class ExtrasEditPlan:
+    """An explicit plan to add or remove extras on a requirement string.
+
+    The plan is bound to the exact requirement string (the *baseline*) it was
+    created from. The extras section is located by the real requirement
+    parser, so brackets appearing elsewhere (for example in an IPv6 URL such
+    as ``http://[::1]/``) are never mistaken for extras. Applying the plan
+    only rewrites the extras section: the package name, URL, specifier and
+    marker keep their original bytes, and the result is re-parsed to verify
+    it is still a valid requirement with an unchanged non-extras payload.
+
+    Extra names are compared and deduplicated per PEP 685 (case-insensitive,
+    with ``-``, ``_`` and ``.`` treated as equivalent separators). Kept
+    extras retain their original spelling and order.
+
+    .. versionadded:: 26.4
+
+    >>> from packaging.requirements import ExtrasEditPlan
+    >>> plan = ExtrasEditPlan('foo[a]; python_version < "3.12"')
+    >>> plan.add("b").apply()
+    'foo[a,b]; python_version < "3.12"'
+    >>> ExtrasEditPlan("foo @ http://[::1]:8080/pkg").add("x").apply()
+    'foo[x] @ http://[::1]:8080/pkg'
+    >>> ExtrasEditPlan("foo[SECURE,secure,sec_ure,sec-ure]").apply()
+    'foo[SECURE,sec_ure]'
+    """
+
+    __slots__ = (
+        "_added",
+        "_extras_span",
+        "_kept",
+        "_name_span",
+        "_parsed",
+        "_removed",
+        "_source",
+    )
+
+    def __init__(self, requirement_string: str) -> None:
+        try:
+            parsed = _parse_requirement(requirement_string)
+        except ParserSyntaxError as e:
+            raise InvalidRequirement(str(e)) from e
+
+        self._source = requirement_string
+        self._parsed = parsed
+        # Spans recorded by the real parser while tokenizing the baseline.
+        self._name_span = parsed.name_span
+        self._extras_span = parsed.extras_span
+        # Existing extras, deduplicated per PEP 685, keeping the first
+        # spelling seen for each canonical name.
+        self._kept: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for extra in parsed.extras:
+            canonical = canonicalize_name(extra)
+            if canonical not in seen:
+                seen.add(canonical)
+                self._kept.append((canonical, extra))
+        # Planned changes: canonical name -> spelling to emit / removal set.
+        self._added: dict[str, str] = {}
+        self._removed: set[str] = set()
+
+    @property
+    def baseline(self) -> str:
+        """The requirement string this plan was created from."""
+        return self._source
+
+    @property
+    def extras(self) -> frozenset[str]:
+        """The canonical (PEP 685) extra names the edited requirement will have."""
+        return frozenset(
+            [canonical for canonical, _ in self._kept if canonical not in self._removed]
+            + [canonical for canonical in self._added if canonical not in self._removed]
+        )
+
+    def add(self, *extras: str) -> ExtrasEditPlan:
+        """Plan to add each of ``extras`` (canonicalized per PEP 685).
+
+        Adding an extra that is already present (under any equivalent
+        spelling) is a no-op. Returns ``self`` so calls can be chained.
+        """
+        for extra in extras:
+            _check_extra_name(extra)
+            canonical = canonicalize_name(extra)
+            self._removed.discard(canonical)
+            if canonical not in {c for c, _ in self._kept}:
+                self._added.setdefault(canonical, extra)
+        return self
+
+    def remove(self, *extras: str) -> ExtrasEditPlan:
+        """Plan to remove each of ``extras`` (canonicalized per PEP 685).
+
+        Removing an extra that is not present is a no-op. Returns ``self``
+        so calls can be chained.
+        """
+        for extra in extras:
+            _check_extra_name(extra)
+            canonical = canonicalize_name(extra)
+            self._added.pop(canonical, None)
+            self._removed.add(canonical)
+        return self
+
+    def apply(self, requirement_string: str | None = None) -> str:
+        """Apply the planned edits and return the edited requirement string.
+
+        If ``requirement_string`` is given it must be identical to the
+        baseline; a changed baseline means this plan's recorded offsets are
+        stale, so :class:`StaleExtrasEditPlanError` is raised instead of
+        silently editing the wrong text.
+
+        The result is re-parsed after editing; if it no longer parses, or
+        the name, URL, specifier or marker changed, an error is raised.
+        """
+        if requirement_string is None:
+            requirement_string = self._source
+        elif requirement_string != self._source:
+            raise StaleExtrasEditPlanError(
+                "requirement string changed since this extras edit plan was "
+                "created; build a new plan from the current string"
+            )
+
+        final = [
+            original
+            for canonical, original in self._kept
+            if canonical not in self._removed
+        ]
+        final.extend(
+            spelling
+            for canonical, spelling in self._added.items()
+            if canonical not in self._removed
+        )
+
+        if final:
+            replacement = "[" + ",".join(final) + "]"
+            if self._extras_span is not None:
+                start, end = self._extras_span
+            else:
+                # No extras section yet: insert right after the package name.
+                assert self._name_span is not None
+                start = end = self._name_span[1]
+        else:
+            if self._extras_span is None:
+                # Nothing to remove and nothing to add: no edit at all.
+                return requirement_string
+            replacement = ""
+            start, end = self._extras_span
+
+        edited = requirement_string[:start] + replacement + requirement_string[end:]
+
+        # Re-parse the edited string: it must still be a valid requirement
+        # and only the extras section may have changed.
+        try:
+            reparsed = _parse_requirement(edited)
+        except ParserSyntaxError as e:
+            raise InvalidRequirement(str(e)) from e
+        if (
+            reparsed.name != self._parsed.name
+            or reparsed.url != self._parsed.url
+            or reparsed.specifier != self._parsed.specifier
+            or _marker_text(reparsed.marker) != _marker_text(self._parsed.marker)
+        ):
+            raise InvalidRequirement(
+                f"extras edit corrupted the requirement: {edited!r}"
+            )
+
+        return edited

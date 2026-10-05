@@ -61,6 +61,49 @@ Usage
     >>> requirements1 == requirements2
     True
 
+Editing extras
+--------------
+
+.. versionadded:: 26.4
+
+When a requirement string must be modified rather than just parsed, an
+explicit *extras edit plan* adds or removes extras while preserving the
+original bytes of everything else (package name, URL, specifier and marker).
+The extras section is located by the real parser, so brackets inside a URL
+(for example an IPv6 literal) are never mistaken for extras, and the edited
+string is re-parsed for validation before it is returned. Extra names are
+deduplicated per PEP 685 (case-insensitive; ``-``, ``_`` and ``.`` are
+equivalent separators).
+
+.. doctest::
+
+    >>> from packaging.requirements import ExtrasEditPlan
+    >>> # The marker text stays byte-identical after adding an extra:
+    >>> plan = ExtrasEditPlan('foo[a]; python_version < "3.12"')
+    >>> plan.add("b").apply()
+    'foo[a,b]; python_version < "3.12"'
+    >>> # Brackets in an IPv6 URL are not treated as extras:
+    >>> ExtrasEditPlan("foo @ http://[::1]:8080/pkg").add("x").apply()
+    'foo[x] @ http://[::1]:8080/pkg'
+    >>> # Duplicate extras are merged per PEP 685:
+    >>> ExtrasEditPlan("foo[SECURE,secure]").apply()
+    'foo[SECURE]'
+    >>> # Removals are canonicalized too, and dropping the last extra
+    >>> # removes the brackets entirely:
+    >>> ExtrasEditPlan("foo[a,b]").remove("A").apply()
+    'foo[b]'
+    >>> # A plan is bound to its baseline string; applying it to a changed
+    >>> # string is rejected:
+    >>> plan = ExtrasEditPlan("foo[a]")
+    >>> plan.apply("foo[c]")
+    Traceback (most recent call last):
+    ...
+    packaging.requirements.StaleExtrasEditPlanError: requirement string changed since this extras edit plan was created; build a new plan from the current string
+
+The tests for this feature can be run on their own with::
+
+    python -m pytest tests/test_requirements.py -k ExtrasEditPlan
+
 .. versionchanged:: 23.2
 
     When a requirement is specified with a URL, the :class:`Requirement` class
@@ -139,3 +182,45 @@ Reference
     does not conform to the specification.
 
     .. versionadded:: 16.1
+
+.. class:: ExtrasEditPlan(requirement_string)
+
+    An explicit plan to add or remove extras on a requirement string, bound
+    to the exact string it was created from. See :ref:`Editing extras` above
+    for examples.
+
+    .. versionadded:: 26.4
+
+    :param str requirement_string: The string representation of a requirement.
+    :raises InvalidRequirement: If the given ``requirement_string`` is not parseable.
+
+    .. attribute:: baseline
+
+      The requirement string this plan was created from.
+
+    .. attribute:: extras
+
+      A frozenset of the canonical (PEP 685) extra names the edited
+      requirement will have.
+
+    .. method:: add(*extras)
+
+      Plan to add each of the given extras. Returns ``self`` for chaining.
+
+    .. method:: remove(*extras)
+
+      Plan to remove each of the given extras. Returns ``self`` for chaining.
+
+    .. method:: apply(requirement_string=None)
+
+      Apply the planned edits and return the edited requirement string. If
+      ``requirement_string`` is given it must equal the baseline, otherwise
+      :class:`StaleExtrasEditPlanError` is raised. The result is re-parsed
+      for validation before being returned.
+
+.. exception:: StaleExtrasEditPlanError
+
+    Raised when an :class:`ExtrasEditPlan` is applied to a requirement string
+    that differs from the baseline the plan was created from.
+
+    .. versionadded:: 26.4

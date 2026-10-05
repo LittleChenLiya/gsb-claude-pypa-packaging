@@ -4,6 +4,17 @@ Changelog
 *unreleased*
 ~~~~~~~~~~~~
 
+Features:
+
+* Add :class:`~packaging.requirements.ExtrasEditPlan`, an explicit extras
+  edit plan for requirement strings. Extras are located by the real parser
+  (so brackets in URLs, e.g. IPv6 literals, are not mistaken for extras),
+  added/removed names are canonicalized and deduplicated per PEP 685, the
+  package name, URL, specifier and marker keep their original bytes, and the
+  edited string is re-parsed for validation. Applying a plan after its
+  baseline string changed raises
+  :class:`~packaging.requirements.StaleExtrasEditPlanError`.
+
 Removals:
 
 * Drop support for EOL Python 3.9. (:pull:`1263`)

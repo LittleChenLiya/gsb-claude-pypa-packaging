@@ -98,6 +98,12 @@ class ParsedRequirement(NamedTuple):
     extras: list[str]
     specifier: str
     marker: MarkerList | None
+    # Byte offsets (half-open ``[start, end)``) of the package name and of the
+    # extras section (including the brackets) in the parsed source. These let
+    # callers locate the extras section exactly as the parser saw it, without
+    # re-scanning the source (e.g. mistaking brackets inside a URL for extras).
+    name_span: tuple[int, int] | None = None
+    extras_span: tuple[int, int] | None = None
 
 
 # --------------------------------------------------------------------------------------
@@ -117,15 +123,24 @@ def _parse_requirement(tokenizer: Tokenizer) -> ParsedRequirement:
         "IDENTIFIER", expected="package name at the start of dependency specifier"
     )
     name = name_token.text
+    name_span = (name_token.position, tokenizer.position)
     tokenizer.consume("WS")
 
-    extras = _parse_extras(tokenizer)
+    extras_span = None
+    if tokenizer.check("LEFT_BRACKET", peek=True):
+        extras_start = tokenizer.position
+        extras = _parse_extras(tokenizer)
+        extras_span = (extras_start, tokenizer.position)
+    else:
+        extras = []
     tokenizer.consume("WS")
 
     url, specifier, marker = _parse_requirement_details(tokenizer)
     tokenizer.expect("END", expected="end of dependency specifier")
 
-    return ParsedRequirement(name, url, extras, specifier, marker)
+    return ParsedRequirement(
+        name, url, extras, specifier, marker, name_span, extras_span
+    )
 
 
 def _parse_requirement_details(
