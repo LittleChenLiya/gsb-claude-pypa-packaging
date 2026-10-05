@@ -21,6 +21,19 @@ automatically, so all you have to do is:
 This runs the tests with the default Python interpreter. This also allows
 you to run select tests instead of the entire test suite.
 
+To run a single test module against the local source tree (rather than an
+installed copy of packaging), point ``PYTHONPATH`` at ``src/`` first:
+
+.. code-block:: console
+
+    $ PYTHONPATH=src python -m pytest tests/test_wheel_url.py -q
+
+On Windows PowerShell:
+
+.. code-block:: console
+
+    > $env:PYTHONPATH="src"; python -m pytest tests/test_wheel_url.py -q
+
 You can also verify that the tests pass on other supported Python interpreters.
 For this we use `nox`_, which will automatically create a `virtualenv`_ for
 each supported Python version and run the tests. For example:
