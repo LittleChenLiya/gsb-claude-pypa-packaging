@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 __all__ = [
+    "ExtrasEditPlan",
     "InvalidRequirement",
     "Requirement",
 ]
@@ -96,6 +97,23 @@ class Requirement:
         if parsed.marker is not None:
             self.marker = Marker.__new__(Marker)
             self.marker._markers = _normalize_extra_values(parsed.marker)
+
+    def plan_extras(self) -> ExtrasEditPlan:
+        """Create an explicit plan for editing this requirement's extras.
+
+        The plan records this requirement as its baseline and lets you stage
+        canonical extras to add and/or remove. Call :meth:`ExtrasEditPlan.apply`
+        to produce a new :class:`Requirement`; this requirement is left
+        unchanged.
+
+        .. doctest::
+
+            >>> from packaging.requirements import Requirement
+            >>> req = Requirement('foo[a]; python_version < "3.12"')
+            >>> req.plan_extras().add("b").apply()
+            <Requirement('foo[a,b]; python_version < "3.12"')>
+        """
+        return ExtrasEditPlan(self)
 
     def _iter_parts(self, name: str) -> Iterator[str]:
         yield name
@@ -190,3 +208,139 @@ class Requirement:
             and self.url == other.url
             and self.marker == other.marker
         )
+
+
+class ExtrasEditPlan:
+    """An explicit, validated plan for editing a :class:`Requirement`'s extras.
+
+    An extras edit plan records the baseline extras of a requirement and a set
+    of canonical extras to add and/or remove. Applying the plan splices the
+    original requirement string at the extras span reported by the real parser,
+    so the package name, URL, version specifier and marker bytes are preserved
+    verbatim. The edited string is then re-parsed to validate it before a new
+    :class:`Requirement` is returned; the original requirement is never
+    modified.
+
+    Extras are canonicalized per PEP 685 (case, and ``-``/``_``/``.``
+    separators), so adding ``"B"`` to a requirement that already provides
+    ``"b"`` is a no-op rather than a duplicate entry.
+
+    :param requirement: The requirement to edit, either a :class:`Requirement`
+        or a requirement string.
+
+    .. doctest::
+
+        >>> from packaging.requirements import ExtrasEditPlan, Requirement
+        >>> req = Requirement('foo[a]; python_version < "3.12"')
+        >>> edited = ExtrasEditPlan(req).add("b").apply()
+        >>> edited
+        <Requirement('foo[a,b]; python_version < "3.12"')>
+        >>> str(edited.marker)
+        'python_version < "3.12"'
+        >>> Requirement('foo').plan_extras().add("a").apply()
+        <Requirement('foo[a]')>
+    """
+
+    __slots__ = ("_baseline", "_operations", "_requirement", "_source")
+
+    def __init__(self, requirement: str | Requirement) -> None:
+        if isinstance(requirement, Requirement):
+            self._requirement: Requirement | None = requirement
+            self._source: str = str(requirement)
+            self._baseline: frozenset[str] = frozenset(
+                canonicalize_name(extra) for extra in requirement.extras
+            )
+        elif isinstance(requirement, str):
+            self._requirement = None
+            self._source = requirement
+            try:
+                parsed = _parse_requirement(requirement)
+            except ParserSyntaxError as e:
+                raise InvalidRequirement(str(e)) from e
+            self._baseline = frozenset(
+                canonicalize_name(extra) for extra in parsed.extras
+            )
+        else:
+            raise TypeError(
+                "requirement must be a str or a Requirement, not "
+                f"{type(requirement).__name__}"
+            )
+        self._operations: list[tuple[str, str]] = []
+
+    def add(self, *extras: str) -> ExtrasEditPlan:
+        """Stage canonical extras to add when the plan is applied.
+
+        Adding an extra that the baseline already provides (under any case or
+        separator spelling) is a no-op.
+        """
+        for extra in extras:
+            self._operations.append(("add", canonicalize_name(extra)))
+        return self
+
+    def remove(self, *extras: str) -> ExtrasEditPlan:
+        """Stage canonical extras to remove when the plan is applied.
+
+        Removing an extra that the baseline does not provide is a no-op.
+        """
+        for extra in extras:
+            self._operations.append(("remove", canonicalize_name(extra)))
+        return self
+
+    def _current_extras(self) -> frozenset[str]:
+        if self._requirement is None:
+            return self._baseline
+        return frozenset(
+            canonicalize_name(extra) for extra in self._requirement.extras
+        )
+
+    def apply(self) -> Requirement:
+        """Apply the plan and return a new, validated :class:`Requirement`.
+
+        The baseline is checked first: if the :class:`Requirement` the plan was
+        created from has had its extras changed since the plan was made, the
+        plan is rejected rather than applied against a stale baseline.
+
+        Staged operations are replayed in call order, so adding an extra and
+        then removing it (or vice versa) yields no net change.
+
+        :raises InvalidRequirement: if the baseline has changed, or if the
+            edited requirement cannot be re-parsed with the same name, URL,
+            specifier and marker.
+        """
+        if self._current_extras() != self._baseline:
+            raise InvalidRequirement(
+                "Cannot apply extras edit plan: the baseline requirement's "
+                "extras have changed since the plan was created"
+            )
+
+        parsed = _parse_requirement(self._source)
+        new_extras_set = set(self._baseline)
+        for operation, extra in self._operations:
+            if operation == "add":
+                new_extras_set.add(extra)
+            else:
+                new_extras_set.discard(extra)
+        new_extras = sorted(new_extras_set)
+        start, end = parsed.extras_span
+        replacement = f"[{','.join(new_extras)}]" if new_extras else ""
+        new_string = self._source[:start] + replacement + self._source[end:]
+
+        # Re-parse the edited string to validate it, and confirm that the bytes
+        # outside the extras span are unchanged -- so the name, URL, specifier
+        # and marker are preserved verbatim.
+        try:
+            new_parsed = _parse_requirement(new_string)
+        except ParserSyntaxError as e:
+            raise InvalidRequirement(str(e)) from e
+        if (
+            frozenset(canonicalize_name(e) for e in new_parsed.extras)
+            != frozenset(new_extras)
+            or new_string[:start] != self._source[:start]
+            or new_string[start + len(replacement):] != self._source[end:]
+        ):
+            raise InvalidRequirement(
+                "Cannot apply extras edit plan: the edited requirement could "
+                "not be re-parsed with the same name, URL, specifier and marker"
+            )
+
+        return Requirement(new_string)

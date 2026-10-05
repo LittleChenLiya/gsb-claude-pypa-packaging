@@ -98,6 +98,7 @@ class ParsedRequirement(NamedTuple):
     extras: list[str]
     specifier: str
     marker: MarkerList | None
+    extras_span: tuple[int, int]
 
 
 # --------------------------------------------------------------------------------------
@@ -117,15 +118,16 @@ def _parse_requirement(tokenizer: Tokenizer) -> ParsedRequirement:
         "IDENTIFIER", expected="package name at the start of dependency specifier"
     )
     name = name_token.text
+    name_end = tokenizer.position
     tokenizer.consume("WS")
 
-    extras = _parse_extras(tokenizer)
+    extras, extras_span = _parse_extras(tokenizer, name_end)
     tokenizer.consume("WS")
 
     url, specifier, marker = _parse_requirement_details(tokenizer)
     tokenizer.expect("END", expected="end of dependency specifier")
 
-    return ParsedRequirement(name, url, extras, specifier, marker)
+    return ParsedRequirement(name, url, extras, specifier, marker, extras_span)
 
 
 def _parse_requirement_details(
@@ -202,13 +204,23 @@ def _parse_requirement_marker(
     return marker
 
 
-def _parse_extras(tokenizer: Tokenizer) -> list[str]:
+def _parse_extras(
+    tokenizer: Tokenizer, name_end: int
+) -> tuple[list[str], tuple[int, int]]:
     """
     extras = (LEFT_BRACKET wsp* extras_list? wsp* RIGHT_BRACKET)?
+
+    Returns the parsed extras and the byte span of the ``[...]`` region in the
+    source. When no brackets are present, the span is a zero-width insertion
+    point immediately after the package name, so callers can splice extras into
+    the source without re-parsing or guessing where the brackets are. The span
+    is taken from the tokenizer rather than a text search, so brackets inside a
+    URL (e.g. an IPv6 host) are never mistaken for extras.
     """
     if not tokenizer.check("LEFT_BRACKET", peek=True):
-        return []
+        return [], (name_end, name_end)
 
+    open_pos = tokenizer.position
     with tokenizer.enclosing_tokens(
         "LEFT_BRACKET",
         "RIGHT_BRACKET",
@@ -217,8 +229,9 @@ def _parse_extras(tokenizer: Tokenizer) -> list[str]:
         tokenizer.consume("WS")
         extras = _parse_extras_list(tokenizer)
         tokenizer.consume("WS")
+    close_pos = tokenizer.position
 
-    return extras
+    return extras, (open_pos, close_pos)
 
 
 def _parse_extras_list(tokenizer: Tokenizer) -> list[str]:

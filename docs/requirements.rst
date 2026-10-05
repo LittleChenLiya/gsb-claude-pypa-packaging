@@ -61,6 +61,58 @@ Usage
     >>> requirements1 == requirements2
     True
 
+Editing extras
+---------------
+
+Use an :class:`ExtrasEditPlan` to add or remove extras while preserving the
+package name, URL, version specifier and marker bytes verbatim. The plan is
+built from the real parser's extras span (so brackets inside a URL, such as an
+IPv6 host, are never mistaken for extras), and the edited string is re-parsed
+to validate it before a new :class:`Requirement` is returned. Extras are
+canonicalized per PEP 685, so case and separator variants merge into one
+entry:
+
+.. doctest::
+
+    >>> from packaging.requirements import ExtrasEditPlan, Requirement
+    >>> req = Requirement('foo[a]; python_version < "3.12"')
+    >>> edited = req.plan_extras().add("b").apply()
+    >>> edited
+    <Requirement('foo[a,b]; python_version < "3.12"')>
+    >>> # The marker bytes are exactly the original ones.
+    >>> str(edited.marker)
+    'python_version < "3.12"'
+    >>> # Case and separator variants canonicalize to the same extra.
+    >>> Requirement("foo[a]").plan_extras().add("A").apply()
+    <Requirement('foo[a]')>
+    >>> Requirement("foo[a-b]").plan_extras().add("a.b").apply()
+    <Requirement('foo[a-b]')>
+    >>> # Duplicate names in the source are merged.
+    >>> Requirement("foo[a,a]").extras
+    {'a'}
+    >>> # Remove extras, or stage several edits at once.
+    >>> Requirement("foo[a,b]").plan_extras().remove("a").apply()
+    <Requirement('foo[b]')>
+    >>> Requirement("foo").plan_extras().add("a").add("b").remove("a").apply()
+    <Requirement('foo[b]')>
+    >>> # An IPv6 direct URL is not broken by the edit.
+    >>> Requirement("foo[a] @ https://[2001:db8::1]/path").plan_extras().add("b").apply()
+    <Requirement('foo[a,b] @ https://[2001:db8::1]/path')>
+
+The plan records the baseline requirement, so if the requirement's extras are
+changed after the plan is created, applying the plan is rejected rather than
+applied against a stale baseline:
+
+.. doctest::
+
+    >>> req = Requirement("foo[a]")
+    >>> plan = req.plan_extras().add("b")
+    >>> req.extras.add("c")
+    >>> plan.apply()
+    Traceback (most recent call last):
+        ...
+    packaging.requirements.InvalidRequirement: ...
+
 .. versionchanged:: 23.2
 
     When a requirement is specified with a URL, the :class:`Requirement` class
@@ -132,6 +184,49 @@ Reference
     .. attribute:: marker
 
       A :class:`~.Marker` of the marker for the requirement. Can be None.
+
+.. class:: ExtrasEditPlan(requirement)
+
+    An explicit, validated plan for editing a :class:`Requirement`'s extras.
+
+    The plan records the baseline extras of a requirement and a set of
+    canonical extras to add and/or remove. Applying the plan splices the
+    original requirement string at the extras span reported by the parser, so
+    the package name, URL, version specifier and marker bytes are preserved
+    verbatim. The edited string is then re-parsed to validate it before a new
+    :class:`Requirement` is returned; the original requirement is never
+    modified.
+
+    Extras are canonicalized per PEP 685 (case, and ``-``/``_``/``.``
+    separators), so adding an extra that the baseline already provides under
+    any spelling is a no-op.
+
+    :param requirement: The requirement to edit, either a :class:`Requirement`
+        or a requirement string.
+
+    .. method:: add(*extras)
+
+       Stage canonical extras to add. Returns the plan, so calls can be
+       chained.
+
+    .. method:: remove(*extras)
+
+       Stage canonical extras to remove. Returns the plan, so calls can be
+       chained.
+
+    .. method:: apply()
+
+       Apply the plan and return a new, validated :class:`Requirement`.
+
+       The baseline is checked first: if the :class:`Requirement` the plan was
+       created from has had its extras changed since the plan was made, the
+       plan is rejected rather than applied against a stale baseline. Staged
+       operations are replayed in call order, so adding an extra and then
+       removing it (or vice versa) yields no net change.
+
+       :raises InvalidRequirement: if the baseline has changed, or if the
+           edited requirement cannot be re-parsed with the same name, URL,
+           specifier and marker.
 
 .. exception:: InvalidRequirement
 

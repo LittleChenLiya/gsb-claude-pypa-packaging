@@ -9,8 +9,9 @@ import pickle
 import pytest
 
 from packaging.markers import Marker
-from packaging.requirements import InvalidRequirement, Requirement
+from packaging.requirements import ExtrasEditPlan, InvalidRequirement, Requirement
 from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 
 EQUAL_DEPENDENCIES = [
     ("packaging>20.1", "packaging>20.1"),
@@ -1060,3 +1061,255 @@ def test_pickle_requirement_25_0_format_loads() -> None:
     assert str(r.specifier) == ">=2.0"
     assert r.marker is None
     assert r == Requirement("requests>=2.0")
+
+
+class TestExtrasEditPlan:
+    """Tests for the explicit :class:`ExtrasEditPlan` editing plan."""
+
+    def test_add_extra_preserves_marker_bytes(self) -> None:
+        # GIVEN
+        source = 'foo[a]; python_version < "3.12"'
+        req = Requirement(source)
+
+        # WHEN
+        edited = req.plan_extras().add("b").apply()
+
+        # THEN -- the marker bytes are exactly the original ones.
+        assert str(edited) == 'foo[a,b]; python_version < "3.12"'
+        assert str(edited.marker) == 'python_version < "3.12"'
+        # The marker substring is byte-identical to the source.
+        assert str(edited).split(";", 1)[1] == source.split(";", 1)[1]
+
+    def test_add_extra_preserves_name_specifier_and_url(self) -> None:
+        # GIVEN
+        source = 'Foo.Bar[a]>=1.0,<2; os_name=="posix"'
+        req = Requirement(source)
+
+        # WHEN
+        edited = req.plan_extras().add("b").apply()
+
+        # THEN -- the name is preserved verbatim, and the specifier and marker
+        # are preserved (str() normalizes spacing, so compare parsed objects).
+        assert edited.name == "Foo.Bar"
+        assert edited.specifier == req.specifier
+        assert edited.marker == req.marker
+        assert edited.extras == {"a", "b"}
+        assert str(edited) == 'Foo.Bar[a,b]<2,>=1.0; os_name == "posix"'
+        # The edited requirement round-trips to an equivalent requirement.
+        assert edited == Requirement(source.replace("[a]", "[a,b]"))
+
+    def test_ipv6_url_is_not_broken(self) -> None:
+        # GIVEN -- an IPv6 "direct reference" URL whose brackets must not be
+        # mistaken for extras.
+        source = "foo[a] @ https://[2001:db8::1]/path"
+        req = Requirement(source)
+
+        # WHEN
+        edited = req.plan_extras().add("b").apply()
+
+        # THEN -- the URL bytes are preserved verbatim.
+        assert edited.url == "https://[2001:db8::1]/path"
+        assert str(edited) == "foo[a,b] @ https://[2001:db8::1]/path"
+
+    def test_brackets_in_url_path_are_not_extras(self) -> None:
+        # GIVEN
+        source = "foo @ https://example.com/[a]/b"
+        req = Requirement(source)
+
+        # WHEN
+        edited = req.plan_extras().add("x").apply()
+
+        # THEN
+        assert edited.url == "https://example.com/[a]/b"
+        assert str(edited) == "foo[x] @ https://example.com/[a]/b"
+
+    def test_url_with_marker_is_preserved(self) -> None:
+        # GIVEN
+        source = 'foo[a] @ https://example.com/path ; python_version < "3.12"'
+        req = Requirement(source)
+
+        # WHEN
+        edited = req.plan_extras().add("b").apply()
+
+        # THEN
+        assert edited.url == "https://example.com/path"
+        assert str(edited.marker) == 'python_version < "3.12"'
+        assert str(edited) == (
+            'foo[a,b] @ https://example.com/path ; python_version < "3.12"'
+        )
+
+    def test_add_to_requirement_without_extras(self) -> None:
+        # GIVEN
+        req = Requirement("foo>=1")
+
+        # WHEN
+        edited = req.plan_extras().add("a").apply()
+
+        # THEN
+        assert edited.extras == {"a"}
+        assert str(edited) == "foo[a]>=1"
+
+    def test_remove_extra(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a,b]>=1")
+
+        # WHEN
+        edited = req.plan_extras().remove("a").apply()
+
+        # THEN
+        assert edited.extras == {"b"}
+        assert str(edited) == "foo[b]>=1"
+
+    def test_remove_all_extras(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a,b]>=1")
+
+        # WHEN
+        edited = req.plan_extras().remove("a").remove("b").apply()
+
+        # THEN
+        assert edited.extras == set()
+        assert str(edited) == "foo>=1"
+
+    def test_remove_nonexistent_extra_is_noop(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a]")
+
+        # WHEN
+        edited = req.plan_extras().remove("z").apply()
+
+        # THEN
+        assert edited.extras == {"a"}
+        assert str(edited) == "foo[a]"
+
+    @pytest.mark.parametrize(
+        ("existing", "added"),
+        [
+            ("a", "A"),
+            ("a", "a"),
+            ("a-b", "a.b"),
+            ("a-b", "a_b"),
+            ("a-b", "A-B"),
+            ("a-b", "a-b"),
+        ],
+    )
+    def test_extras_are_canonicalized_and_deduped(
+        self, existing: str, added: str
+    ) -> None:
+        # GIVEN
+        req = Requirement(f"foo[{existing}]")
+
+        # WHEN
+        edited = req.plan_extras().add(added).apply()
+
+        # THEN -- case and separator variants merge into one canonical extra.
+        assert edited.extras == {canonicalize_name(existing)}
+        assert str(edited) == f"foo[{canonicalize_name(existing)}]"
+
+    def test_duplicate_extras_in_source_are_merged(self) -> None:
+        # GIVEN -- duplicate names in the source are merged by the parser.
+        req = Requirement("foo[a,a]")
+        assert req.extras == {"a"}
+
+        # WHEN
+        edited = req.plan_extras().add("A").apply()
+
+        # THEN
+        assert edited.extras == {"a"}
+        assert str(edited) == "foo[a]"
+
+    def test_operations_are_replayed_in_order(self) -> None:
+        # GIVEN
+        req = Requirement("foo")
+
+        # WHEN / THEN -- add then remove yields no net change.
+        assert str(req.plan_extras().add("a").remove("a").apply()) == "foo"
+        # Remove then add yields the added extra.
+        assert str(req.plan_extras().remove("a").add("a").apply()) == "foo[a]"
+        # Last operation wins.
+        assert (
+            str(req.plan_extras().add("a").add("b").remove("a").apply())
+            == "foo[b]"
+        )
+
+    def test_apply_is_idempotent(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a]")
+        plan = req.plan_extras().add("b")
+
+        # WHEN / THEN -- applying twice yields the same result.
+        first = plan.apply()
+        second = plan.apply()
+        assert str(first) == str(second)
+        assert first == second
+
+    def test_original_requirement_is_unchanged(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a]")
+
+        # WHEN
+        _ = req.plan_extras().add("b").apply()
+
+        # THEN
+        assert req.extras == {"a"}
+        assert str(req) == "foo[a]"
+
+    def test_baseline_change_rejects_old_plan(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a]")
+        plan = req.plan_extras().add("b")
+
+        # WHEN -- the baseline requirement's extras change.
+        req.extras.add("c")
+
+        # THEN -- the stale plan is rejected rather than applied.
+        with pytest.raises(InvalidRequirement):
+            plan.apply()
+
+    def test_baseline_unchanged_applies(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a]")
+        plan = req.plan_extras().add("b")
+
+        # WHEN / THEN -- no baseline change, so the plan applies.
+        edited = plan.apply()
+        assert edited.extras == {"a", "b"}
+
+    def test_plan_from_string(self) -> None:
+        # GIVEN / WHEN
+        edited = ExtrasEditPlan('foo[a]; python_version < "3.12"').add("b").apply()
+
+        # THEN
+        assert str(edited) == 'foo[a,b]; python_version < "3.12"'
+
+    def test_invalid_extra_rejected_on_reparse(self) -> None:
+        # GIVEN -- an extra that cannot be parsed as an identifier.
+        req = Requirement("foo[a]")
+        plan = req.plan_extras().add("a b")
+
+        # WHEN / THEN -- re-parsing the edited string fails validation.
+        with pytest.raises(InvalidRequirement):
+            plan.apply()
+
+    def test_str_of_requirement_is_unchanged(self) -> None:
+        # GIVEN / WHEN / THEN -- stringification is unaffected by the plan.
+        assert str(Requirement('foo[a]; python_version < "3.12"')) == (
+            'foo[a]; python_version < "3.12"'
+        )
+        assert str(Requirement("foo[a,b]>=1")) == "foo[a,b]>=1"
+
+    def test_plan_rejects_wrong_type(self) -> None:
+        # GIVEN / WHEN / THEN
+        with pytest.raises(TypeError):
+            ExtrasEditPlan(123)  # type: ignore[arg-type]
+
+    def test_edited_requirement_compares_equal_to_equivalent(self) -> None:
+        # GIVEN
+        req = Requirement("foo[a]")
+
+        # WHEN
+        edited = req.plan_extras().add("B").apply()
+
+        # THEN
+        assert edited == Requirement("foo[a,b]")
+        assert hash(edited) == hash(Requirement("foo[a,b]"))
